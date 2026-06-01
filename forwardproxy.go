@@ -101,14 +101,18 @@ type Handler struct {
 	// AuthAuditLogPath is a JSON lines log of successfully authenticated proxy requests.
 	AuthAuditLogPath string `json:"auth_audit_log,omitempty"`
 
+	// TrafficAuditLogPath is a JSON lines log of completed CONNECT tunnel traffic.
+	TrafficAuditLogPath string `json:"traffic_audit_log,omitempty"`
+
 	httpTransport *http.Transport
 
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
 
-	aclRules     []aclRule
-	authAuditLog *authAuditLogger
+	aclRules        []aclRule
+	authAuditLog    *authAuditLogger
+	trafficAuditLog *trafficAuditLogger
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
@@ -132,6 +136,13 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 			return fmt.Errorf("failed to open auth audit log: %w", err)
 		}
 		h.authAuditLog = auditLog
+	}
+	if h.TrafficAuditLogPath != "" {
+		trafficLog, err := newTrafficAuditLogger(h.TrafficAuditLogPath)
+		if err != nil {
+			return fmt.Errorf("failed to open traffic audit log: %w", err)
+		}
+		h.trafficAuditLog = trafficLog
 	}
 
 	if h.DialTimeout <= 0 {
@@ -259,10 +270,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 
 // Cleanup closes resources opened during provisioning.
 func (h *Handler) Cleanup() error {
+	var err error
 	if h.authAuditLog != nil {
-		return h.authAuditLog.Close()
+		err = errors.Join(err, h.authAuditLog.Close())
 	}
-	return nil
+	if h.trafficAuditLog != nil {
+		err = errors.Join(err, h.trafficAuditLog.Close())
+	}
+	return err
 }
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
@@ -366,14 +381,25 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 
 		h.logAuthAudit(r, username, hostPort)
 
+		started := time.Now()
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
-			return serveHijack(w, targetConn)
+			if h.trafficAuditLog == nil {
+				return serveHijack(w, targetConn)
+			}
+			traffic, err := serveHijackWithTraffic(w, targetConn)
+			h.logTrafficAudit(r, username, hostPort, traffic, time.Since(started))
+			return err
 		case 2: // http2: keep reading from "request" and writing into same response
 			fallthrough
 		case 3:
 			defer r.Body.Close()
-			return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			if h.trafficAuditLog == nil {
+				return dualStream(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			}
+			traffic, err := dualStreamWithTraffic(targetConn, r.Body, w, r.Header.Get("Padding") != "")
+			h.logTrafficAudit(r, username, hostPort, traffic, time.Since(started))
+			return err
 		}
 
 		panic("There was a check for http version, yet it's incorrect")
@@ -530,6 +556,22 @@ type authAuditRecord struct {
 	ServerName string `json:"server_name"`
 }
 
+type trafficAuditRecord struct {
+	Timestamp           string `json:"ts"`
+	Event               string `json:"event"`
+	Username            string `json:"username"`
+	RemoteIP            string `json:"remote_ip"`
+	Method              string `json:"method"`
+	Host                string `json:"host"`
+	URI                 string `json:"uri"`
+	Proto               string `json:"proto"`
+	ServerName          string `json:"server_name"`
+	BytesClientToTarget int64  `json:"bytes_client_to_target"`
+	BytesTargetToClient int64  `json:"bytes_target_to_client"`
+	BytesTotal          int64  `json:"bytes_total"`
+	DurationMS          int64  `json:"duration_ms"`
+}
+
 type authAuditLogger struct {
 	mu   sync.Mutex
 	file *os.File
@@ -559,6 +601,35 @@ func (l *authAuditLogger) Close() error {
 	return l.file.Close()
 }
 
+type trafficAuditLogger struct {
+	mu   sync.Mutex
+	file *os.File
+	enc  *json.Encoder
+}
+
+func newTrafficAuditLogger(path string) (*trafficAuditLogger, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return &trafficAuditLogger{
+		file: file,
+		enc:  json.NewEncoder(file),
+	}, nil
+}
+
+func (l *trafficAuditLogger) Write(record trafficAuditRecord) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.enc.Encode(record)
+}
+
+func (l *trafficAuditLogger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.file.Close()
+}
+
 func (h Handler) logAuthAudit(r *http.Request, username, hostPort string) {
 	h.logAuthAuditRequest(r, username, r.Method, hostPort, hostPort, r.Proto)
 }
@@ -579,6 +650,30 @@ func (h Handler) logAuthAuditRequest(r *http.Request, username, method, host, ur
 	}
 	if err := h.authAuditLog.Write(record); err != nil {
 		h.logger.Error("failed to write auth audit log", zap.Error(err))
+	}
+}
+
+func (h Handler) logTrafficAudit(r *http.Request, username, hostPort string, traffic tunnelTraffic, duration time.Duration) {
+	if h.trafficAuditLog == nil || username == "" {
+		return
+	}
+	record := trafficAuditRecord{
+		Timestamp:           time.Now().UTC().Format(time.RFC3339Nano),
+		Event:               "connect_closed",
+		Username:            username,
+		RemoteIP:            remoteIPOnly(r.RemoteAddr),
+		Method:              r.Method,
+		Host:                hostPort,
+		URI:                 hostPort,
+		Proto:               r.Proto,
+		ServerName:          serverName(r),
+		BytesClientToTarget: traffic.ClientToTarget,
+		BytesTargetToClient: traffic.TargetToClient,
+		BytesTotal:          traffic.ClientToTarget + traffic.TargetToClient,
+		DurationMS:          duration.Milliseconds(),
+	}
+	if err := h.trafficAuditLog.Write(record); err != nil {
+		h.logger.Error("failed to write traffic audit log", zap.Error(err))
 	}
 }
 
@@ -760,6 +855,32 @@ func serveHijack(w http.ResponseWriter, targetConn net.Conn) error {
 	return dualStream(targetConn, clientConn, clientConn, false)
 }
 
+func serveHijackWithTraffic(w http.ResponseWriter, targetConn net.Conn) (tunnelTraffic, error) {
+	w.WriteHeader(http.StatusOK)
+	clientConn, brw, err := http.NewResponseController(w).Hijack()
+	if err != nil {
+		return tunnelTraffic{}, caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("hijack failed: %v", err))
+	}
+	defer clientConn.Close()
+
+	var bufferedClientToTarget int64
+	if n := brw.Reader.Buffered(); n > 0 {
+		rbuf, _ := brw.Peek(n)
+		written, _ := targetConn.Write(rbuf)
+		bufferedClientToTarget = int64(written)
+	}
+	err = brw.Flush()
+	if err != nil {
+		return tunnelTraffic{ClientToTarget: bufferedClientToTarget}, caddyhttp.Error(http.StatusInternalServerError,
+			fmt.Errorf("failed to flush to client: %v", err))
+	}
+
+	traffic, err := dualStreamWithTraffic(targetConn, clientConn, clientConn, false)
+	traffic.ClientToTarget += bufferedClientToTarget
+	return traffic, err
+}
+
 const (
 	NoPadding        = 0
 	AddPadding       = 1
@@ -767,29 +888,79 @@ const (
 	NumFirstPaddings = 8
 )
 
+type tunnelTraffic struct {
+	ClientToTarget int64
+	TargetToClient int64
+}
+
 // Copies data target->clientReader and clientWriter->target, and flushes as needed
 // Returns when clientWriter-> target stream is done.
 // Caddy should finish writing target -> clientReader.
 func dualStream(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) error {
-	stream := func(w io.Writer, r io.Reader, paddingType int) error {
-		// copy bytes from r to w
-		bufPtr := bufferPool.Get().(*[]byte)
-		buf := *bufPtr
-		buf = buf[0:cap(buf)]
-		_, _err := flushingIoCopy(w, r, buf, paddingType)
-		bufferPool.Put(bufPtr)
-
-		if cw, ok := w.(closeWriter); ok {
-			_ = cw.CloseWrite()
-		}
-		return _err
-	}
 	if padding {
-		go stream(target, clientReader, RemovePadding)
-		return stream(clientWriter, target, AddPadding)
+		go copyTunnelStream(target, clientReader, RemovePadding) //nolint: errcheck
+		_, err := copyTunnelStream(clientWriter, target, AddPadding)
+		return err
 	}
-	go stream(target, clientReader, NoPadding) //nolint: errcheck
-	return stream(clientWriter, target, NoPadding)
+	go copyTunnelStream(target, clientReader, NoPadding) //nolint: errcheck
+	_, err := copyTunnelStream(clientWriter, target, NoPadding)
+	return err
+}
+
+func dualStreamWithTraffic(target net.Conn, clientReader io.ReadCloser, clientWriter io.Writer, padding bool) (tunnelTraffic, error) {
+	type copyResult struct {
+		direction string
+		written   int64
+		err       error
+	}
+
+	clientToTargetPadding := NoPadding
+	targetToClientPadding := NoPadding
+	if padding {
+		clientToTargetPadding = RemovePadding
+		targetToClientPadding = AddPadding
+	}
+
+	resultCh := make(chan copyResult, 2)
+	go func() {
+		written, err := copyTunnelStream(target, clientReader, clientToTargetPadding)
+		resultCh <- copyResult{direction: "client_to_target", written: written, err: err}
+	}()
+	go func() {
+		written, err := copyTunnelStream(clientWriter, target, targetToClientPadding)
+		resultCh <- copyResult{direction: "target_to_client", written: written, err: err}
+	}()
+
+	var traffic tunnelTraffic
+	var firstErr error
+	for i := 0; i < 2; i++ {
+		result := <-resultCh
+		if i == 0 && result.direction == "target_to_client" && clientReader != nil {
+			_ = clientReader.Close()
+		}
+		if result.direction == "client_to_target" {
+			traffic.ClientToTarget = result.written
+		} else {
+			traffic.TargetToClient = result.written
+		}
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
+	}
+	return traffic, firstErr
+}
+
+func copyTunnelStream(w io.Writer, r io.Reader, paddingType int) (int64, error) {
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	buf = buf[0:cap(buf)]
+	written, err := flushingIoCopy(w, r, buf, paddingType)
+	bufferPool.Put(bufPtr)
+
+	if cw, ok := w.(closeWriter); ok {
+		_ = cw.CloseWrite()
+	}
+	return written, err
 }
 
 type closeWriter interface {

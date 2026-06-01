@@ -109,6 +109,16 @@ func (h *Handler) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 			}
 			h.AuthAuditLogPath = args[0]
 
+		case "traffic_audit_log":
+			args := d.RemainingArgs()
+			if len(args) != 1 {
+				return d.ArgErr()
+			}
+			if h.TrafficAuditLogPath != "" {
+				return d.Err("traffic_audit_log subdirective specified twice")
+			}
+			h.TrafficAuditLogPath = args[0]
+
 		case "disable_insecure_upstreams_check":
 			args := d.RemainingArgs()
 			if len(args) != 0 {

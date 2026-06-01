@@ -23,6 +23,7 @@ import (
 	"crypto/subtle"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -97,13 +98,17 @@ type Handler struct {
 	// Ports to be allowed to connect to (if non-empty).
 	AllowedPorts []int `json:"allowed_ports,omitempty"`
 
+	// AuthAuditLogPath is a JSON lines log of successfully authenticated proxy requests.
+	AuthAuditLogPath string `json:"auth_audit_log,omitempty"`
+
 	httpTransport *http.Transport
 
 	// overridden dialContext allows us to redirect requests to upstream proxy
 	dialContext func(ctx context.Context, network, address string) (net.Conn, error)
 	upstream    *url.URL // address of upstream proxy
 
-	aclRules []aclRule
+	aclRules     []aclRule
+	authAuditLog *authAuditLogger
 
 	// TODO: temporary/deprecated - we should try to reuse existing authentication modules instead!
 	AuthCredentials [][]byte `json:"auth_credentials,omitempty"` // slice with base64-encoded credentials
@@ -120,6 +125,14 @@ func (Handler) CaddyModule() caddy.ModuleInfo {
 // Provision ensures that h is set up properly before use.
 func (h *Handler) Provision(ctx caddy.Context) error {
 	h.logger = ctx.Logger(h)
+
+	if h.AuthAuditLogPath != "" {
+		auditLog, err := newAuthAuditLogger(h.AuthAuditLogPath)
+		if err != nil {
+			return fmt.Errorf("failed to open auth audit log: %w", err)
+		}
+		h.authAuditLog = auditLog
+	}
 
 	if h.DialTimeout <= 0 {
 		h.DialTimeout = caddy.Duration(30 * time.Second)
@@ -244,6 +257,14 @@ func (h *Handler) Provision(ctx caddy.Context) error {
 	return nil
 }
 
+// Cleanup closes resources opened during provisioning.
+func (h *Handler) Cleanup() error {
+	if h.authAuditLog != nil {
+		return h.authAuditLog.Close()
+	}
+	return nil
+}
+
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	// start by splitting the request host and port
 	reqHost, _, err := net.SplitHostPort(r.Host)
@@ -252,8 +273,9 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	}
 
 	var authErr error
+	var username string
 	if h.AuthCredentials != nil {
-		authErr = h.checkCredentials(r)
+		username, authErr = h.checkCredentials(r)
 	}
 	if h.ProbeResistance != nil && len(h.ProbeResistance.Domain) > 0 && reqHost == h.ProbeResistance.Domain {
 		return serveHiddenPage(w, authErr)
@@ -342,6 +364,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 		}
 		defer targetConn.Close()
 
+		h.logAuthAudit(r, username, hostPort)
+
 		switch r.ProtoMajor {
 		case 1: // http1: hijack the whole flow
 			return serveHijack(w, targetConn)
@@ -364,6 +388,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	if r.URL.Host == "" {
 		r.URL.Host = r.Host
 	}
+	auditMethod := r.Method
+	auditHost := r.URL.Host
+	auditURI := r.URL.RequestURI()
+	auditProto := r.Proto
+	h.logAuthAuditRequest(r, username, auditMethod, auditHost, auditURI, auditProto)
+
 	r.Proto = "HTTP/1.1"
 	r.ProtoMajor = 1
 	r.ProtoMinor = 1
@@ -446,13 +476,13 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyht
 	return forwardResponse(w, response)
 }
 
-func (h Handler) checkCredentials(r *http.Request) error {
+func (h Handler) checkCredentials(r *http.Request) (string, error) {
 	pa := strings.Split(r.Header.Get("Proxy-Authorization"), " ")
 	if len(pa) != 2 {
-		return errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
+		return "", errors.New("Proxy-Authorization is required! Expected format: <type> <credentials>")
 	}
 	if strings.ToLower(pa[0]) != "basic" {
-		return errors.New("auth type is not supported")
+		return "", errors.New("auth type is not supported")
 	}
 	for _, creds := range h.AuthCredentials {
 		if subtle.ConstantTimeCompare(creds, []byte(pa[1])) == 1 {
@@ -460,11 +490,12 @@ func (h Handler) checkCredentials(r *http.Request) error {
 			buf := make([]byte, base64.StdEncoding.DecodedLen(len(creds)))
 			_, _ = base64.StdEncoding.Decode(buf, creds) // should not err ever since we are decoding a known good input
 			cred := string(buf)
-			repl.Set("http.auth.user.id", cred[:strings.IndexByte(cred, ':')])
+			username := cred[:strings.IndexByte(cred, ':')]
+			repl.Set("http.auth.user.id", username)
 			// Please do not consider this to be timing-attack-safe code. Simple equality is almost
 			// mindlessly substituted with constant time algo and there ARE known issues with this code,
 			// e.g. size of smallest credentials is guessable. TODO: protect from all the attacks! Hash?
-			return nil
+			return username, nil
 		}
 	}
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
@@ -472,7 +503,7 @@ func (h Handler) checkCredentials(r *http.Request) error {
 	n, err := base64.StdEncoding.Decode(buf, []byte(pa[1]))
 	if err != nil {
 		repl.Set("http.auth.user.id", "invalidbase64:"+err.Error())
-		return err
+		return "", err
 	}
 	if utf8.Valid(buf[:n]) {
 		cred := string(buf[:n])
@@ -485,7 +516,85 @@ func (h Handler) checkCredentials(r *http.Request) error {
 	} else {
 		repl.Set("http.auth.user.id", "invalid::")
 	}
-	return errors.New("invalid credentials")
+	return "", errors.New("invalid credentials")
+}
+
+type authAuditRecord struct {
+	Timestamp  string `json:"ts"`
+	Username   string `json:"username"`
+	RemoteIP   string `json:"remote_ip"`
+	Method     string `json:"method"`
+	Host       string `json:"host"`
+	URI        string `json:"uri"`
+	Proto      string `json:"proto"`
+	ServerName string `json:"server_name"`
+}
+
+type authAuditLogger struct {
+	mu   sync.Mutex
+	file *os.File
+	enc  *json.Encoder
+}
+
+func newAuthAuditLogger(path string) (*authAuditLogger, error) {
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	return &authAuditLogger{
+		file: file,
+		enc:  json.NewEncoder(file),
+	}, nil
+}
+
+func (l *authAuditLogger) Write(record authAuditRecord) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.enc.Encode(record)
+}
+
+func (l *authAuditLogger) Close() error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.file.Close()
+}
+
+func (h Handler) logAuthAudit(r *http.Request, username, hostPort string) {
+	h.logAuthAuditRequest(r, username, r.Method, hostPort, hostPort, r.Proto)
+}
+
+func (h Handler) logAuthAuditRequest(r *http.Request, username, method, host, uri, proto string) {
+	if h.authAuditLog == nil || username == "" {
+		return
+	}
+	record := authAuditRecord{
+		Timestamp:  time.Now().UTC().Format(time.RFC3339Nano),
+		Username:   username,
+		RemoteIP:   remoteIPOnly(r.RemoteAddr),
+		Method:     method,
+		Host:       host,
+		URI:        uri,
+		Proto:      proto,
+		ServerName: serverName(r),
+	}
+	if err := h.authAuditLog.Write(record); err != nil {
+		h.logger.Error("failed to write auth audit log", zap.Error(err))
+	}
+}
+
+func remoteIPOnly(remoteAddr string) string {
+	host, _, err := net.SplitHostPort(remoteAddr)
+	if err != nil {
+		return remoteAddr
+	}
+	return host
+}
+
+func serverName(r *http.Request) string {
+	if r.TLS == nil {
+		return ""
+	}
+	return r.TLS.ServerName
 }
 
 func (h Handler) shouldServePACFile(r *http.Request) bool {
@@ -854,6 +963,7 @@ func readLinesFromFile(filename string) ([]string, error) {
 // Interface guards
 var (
 	_ caddy.Provisioner           = (*Handler)(nil)
+	_ caddy.CleanerUpper          = (*Handler)(nil)
 	_ caddyhttp.MiddlewareHandler = (*Handler)(nil)
 	_ caddyfile.Unmarshaler       = (*Handler)(nil)
 )
